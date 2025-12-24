@@ -1,13 +1,11 @@
-FROM python:3.9-alpine
+FROM python:3.9-slim
 
 WORKDIR /app
 
-# Устанавливаем системные зависимости
-RUN apk add --no-cache gcc musl-dev linux-headers
-
 COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+
+# Простая установка зависимостей
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
