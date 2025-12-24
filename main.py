@@ -16,7 +16,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-ADMINS = ['MaksimXyila', 'ar_got']  # Без @
+
+# ========== АДМИНЫ ПО УМОЛЧАНИЮ ==========
+# ID или username администраторов
+DEFAULT_ADMINS = {
+    'MaksimXyila': {'id': None, 'username': 'MaksimXyila'},
+    'ar_got': {'id': None, 'username': 'ar_got'}
+}
+
+# Хранилище администраторов (username -> данные)
+active_admins = {}
 
 if not BOT_TOKEN:
     logger.error("❌ BOT_TOKEN не установлен!")
@@ -28,8 +37,8 @@ dp = Dispatcher(bot, storage=MemoryStorage())
 # ========== БАЗА ДАННЫХ ==========
 class Database:
     def __init__(self):
-        self.users = {}  # user_id -> данные
-        self.agents = {}  # username -> данные агента
+        self.users = {}
+        self.agents = {}
         self.transactions = []
         self.sessions = {}
         self.transaction_counter = 1
@@ -42,10 +51,17 @@ class Database:
         if user_id not in self.users:
             self.users[user_id] = {
                 'id': user_id,
-                'username': username,
-                'full_name': full_name,
+                'username': username or f"user_{user_id}",
+                'full_name': full_name or "Неизвестно",
                 'role': role
             }
+            
+            # Если это известный админ по username
+            if username in DEFAULT_ADMINS:
+                self.users[user_id]['role'] = 'admin'
+                active_admins[username] = {'id': user_id, 'username': username}
+                logger.info(f"Зарегистрирован админ: {username} (ID: {user_id})")
+            
             if role == 'agent':
                 self.agents[username] = self.users[user_id]
     
@@ -198,6 +214,25 @@ def get_confirmation_keyboard():
     )
     return keyboard
 
+# ========== ПРОВЕРКА ЯВЛЯЕТСЯ ЛИ АДМИНОМ ==========
+def is_admin(user):
+    """Проверка, является ли пользователь администратором"""
+    if not user:
+        return False
+    
+    # Проверка по username
+    username = user.username or ""
+    if username in DEFAULT_ADMINS:
+        return True
+    
+    # Проверка по ID (если админ уже зарегистрирован)
+    user_id = user.id
+    for admin_data in active_admins.values():
+        if admin_data.get('id') == user_id:
+            return True
+    
+    return False
+
 # ========== КОМАНДЫ ==========
 @dp.message_handler(Command('start'))
 async def start_command(message: types.Message):
@@ -206,7 +241,7 @@ async def start_command(message: types.Message):
     full_name = message.from_user.full_name or ""
     
     # Регистрируем пользователя
-    role = 'admin' if username in ADMINS else 'user'
+    role = 'admin' if is_admin(message.from_user) else 'user'
     db.add_user(user_id, username, full_name, role)
     
     if message.chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
@@ -222,12 +257,12 @@ async def help_command(message: types.Message):
 
 @dp.message_handler(Command('members'))
 async def members_command(message: types.Message):
-    is_admin = message.from_user.username in ADMINS
-    await message.answer("👥 Список участников:", reply_markup=get_members_menu(show_delete=is_admin))
+    is_admin_user = is_admin(message.from_user)
+    await message.answer("👥 Список участников:", reply_markup=get_members_menu(show_delete=is_admin_user))
 
 @dp.message_handler(Command('rub'))
 async def rub_command(message: types.Message):
-    if message.from_user.username not in ADMINS:
+    if not is_admin(message.from_user):
         return await message.answer("⚠️ Только для администраторов")
     
     try:
@@ -239,7 +274,7 @@ async def rub_command(message: types.Message):
 
 @dp.message_handler(Command('stop'))
 async def stop_command(message: types.Message):
-    if message.from_user.username not in ADMINS:
+    if not is_admin(message.from_user):
         return await message.answer("⚠️ Только для администраторов")
     
     if db.active_session:
@@ -248,40 +283,58 @@ async def stop_command(message: types.Message):
     else:
         await message.answer("⚠️ Нет активной сессии")
 
-@dp.message_handler(Command('test'))
-async def test_command(message: types.Message):
-    """Тестовая команда для проверки"""
-    await message.answer(
-        "Тестовые данные для проверки:\n\n"
-        "1. +79019786832\n"
-        "2. 500!\n"
-        "3. 💛Тбанк💛\n"
-        "4. sir+123@outluk.ru"
-    )
+@dp.message_handler(Command('debug'))
+async def debug_command(message: types.Message):
+    """Команда для отладки"""
+    user = message.from_user
+    logger.info(f"DEBUG: User: {user.username}, ID: {user.id}, Is admin: {is_admin(user)}")
+    
+    debug_info = f"""
+👤 **Информация о пользователе:**
+ID: `{user.id}`
+Username: @{user.username or 'нет'}
+Имя: {user.full_name}
+Админ: {'✅ Да' if is_admin(user) else '❌ Нет'}
+
+📊 **Статус сессии:**
+Активна: {'✅ Да' if db.active_session else '❌ Нет'}
+Цель: {db.current_target}₽
+Текущая сумма: {db.current_amount}₽
+
+💾 **Кэш данных:**
+Админы в кэше: {len(admin_temp_data)}
+    """
+    
+    await message.answer(debug_info, parse_mode='Markdown')
 
 # ========== НАЗНАЧЕНИЕ АГЕНТА ==========
 @dp.message_handler()
 async def handle_messages(message: types.Message):
     text = message.text or ""
-    username = message.from_user.username or ""
     
     # 1. Обработка назначения агента (регистронезависимо)
     agent_pattern = r'(?i)агент\s+@(\w+)'
     match = re.search(agent_pattern, text)
     
-    if match and username in ADMINS:
+    if match and is_admin(message.from_user):
         agent_username = match.group(1)
         agent = db.set_agent(agent_username)
         await message.answer(f"✅ @{agent_username} назначен агентом")
         return
     
     # 2. Обработка данных админа
-    if username in ADMINS:
+    if is_admin(message.from_user):
         await handle_admin_data(message, text)
+    else:
+        # Логируем сообщения от не-админов
+        logger.info(f"Сообщение от пользователя @{message.from_user.username}: {text[:50]}")
 
 # ========== ОБРАБОТКА ДАННЫХ АДМИНА ==========
 async def handle_admin_data(message: types.Message, text: str):
     user_id = message.from_user.id
+    
+    # Логируем сообщение админа
+    logger.info(f"Сообщение от админа ID {user_id}: {text}")
     
     # Инициализируем кэш для пользователя
     if user_id not in admin_temp_data:
@@ -300,22 +353,27 @@ async def handle_admin_data(message: types.Message, text: str):
     phone_match = re.search(r'\+7\d{10}', text)
     if phone_match:
         data['phone'] = phone_match.group()
+        logger.info(f"Найден телефон: {data['phone']}")
     
     # Ищем сумму (форматы: 500! или !500 или просто 500)
     amount_match = re.search(r'[!]?(\d+)[!]?', text)
     if amount_match:
         data['amount'] = int(amount_match.group(1))
+        logger.info(f"Найдена сумма: {data['amount']}")
     
     # Ищем банк
     if '💚Сбер💚' in text:
         data['bank'] = '💚Сбер💚'
+        logger.info("Найден банк: Сбер")
     elif '💛Тбанк💛' in text:
         data['bank'] = '💛Тбанк💛'
+        logger.info("Найден банк: Тбанк")
     
     # Ищем email (формат: sir+цифры@outluk.ru)
     email_match = re.search(r'sir\+\d+@outluk\.ru', text)
     if email_match:
         data['email'] = email_match.group()
+        logger.info(f"Найден email: {data['email']}")
         
         # КОГДА НАШЛИ EMAIL - ОБРАБАТЫВАЕМ ВСЕ ДАННЫЕ
         await process_admin_data(message, user_id, data)
@@ -376,10 +434,10 @@ async def process_admin_data(message: types.Message, user_id: int, data: dict):
 # ========== CALLBACK ОБРАБОТЧИКИ ==========
 @dp.callback_query_handler(lambda c: c.data == 'members')
 async def show_members(callback: types.CallbackQuery):
-    is_admin = callback.from_user.username in ADMINS
+    is_admin_user = is_admin(callback.from_user)
     await callback.message.edit_text(
         "👥 Список участников:",
-        reply_markup=get_members_menu(show_delete=is_admin)
+        reply_markup=get_members_menu(show_delete=is_admin_user)
     )
     await callback.answer()
 
@@ -425,21 +483,37 @@ async def show_instructions(callback: types.CallbackQuery):
 
 @dp.callback_query_handler(lambda c: c.data in ['subscribe', 'send_receipt'])
 async def send_video(callback: types.CallbackQuery):
-    video_file = 'instructions.mp4' if callback.data == 'subscribe' else 'check.mp4'
+    # Определяем какое видео отправлять
+    if callback.data == 'subscribe':
+        video_filename = 'instructions.mp4'
+        caption = "📹 Инструкция по подключению подписки"
+    else:
+        video_filename = 'check.mp4'
+        caption = "📹 Инструкция по отправке чека"
     
     try:
-        # Пытаемся отправить видео
-        with open(f"media/{video_file}", 'rb') as video:
-            await bot.send_video(
-                chat_id=callback.message.chat.id,
-                video=types.InputFile(video),
-                caption=f"📹 {video_file}"
-            )
-    except FileNotFoundError:
-        await callback.message.answer(f"📹 Видео {video_file} будет отправлено в группу")
+        # Пытаемся найти и отправить видео
+        # Сначала проверяем локально
+        if os.path.exists(video_filename):
+            video = types.InputFile(video_filename)
+        elif os.path.exists(f"media/{video_filename}"):
+            video = types.InputFile(f"media/{video_filename}")
+        else:
+            # Если видео нет - отправляем сообщение
+            await callback.message.answer(f"📹 {caption}")
+            await callback.answer()
+            return
+        
+        # Отправляем видео в тот же чат
+        await bot.send_video(
+            chat_id=callback.message.chat.id,
+            video=video,
+            caption=caption
+        )
+        
     except Exception as e:
         logger.error(f"Ошибка отправки видео: {e}")
-        await callback.message.answer(f"📹 Видеоинструкция: {video_file}")
+        await callback.message.answer(f"📹 {caption}")
     
     await callback.answer()
 
@@ -506,10 +580,10 @@ async def back_to_main(callback: types.CallbackQuery):
 
 @dp.callback_query_handler(lambda c: c.data == 'back_to_members')
 async def back_to_members(callback: types.CallbackQuery):
-    is_admin = callback.from_user.username in ADMINS
+    is_admin_user = is_admin(callback.from_user)
     await callback.message.edit_text(
         "👥 Список участников:",
-        reply_markup=get_members_menu(show_delete=is_admin)
+        reply_markup=get_members_menu(show_delete=is_admin_user)
     )
     await callback.answer()
 
@@ -520,12 +594,16 @@ async def on_startup(dp: Dispatcher):
         types.BotCommand("start", "Запустить бота"),
         types.BotCommand("help", "Помощь и инструкции"),
         types.BotCommand("members", "Список участников"),
-        types.BotCommand("rub", "Установить цель на сессию (админы)"),
-        types.BotCommand("stop", "Остановить сессию (админы)"),
+        types.BotCommand("rub", "Установить цель на сессию"),
+        types.BotCommand("stop", "Остановить сессию"),
+        types.BotCommand("debug", "Отладка (админы)"),
     ]
     await bot.set_my_commands(commands)
     
+    logger.info("=" * 50)
     logger.info("✅ Бот запущен и готов к работе!")
+    logger.info(f"Токен: {BOT_TOKEN[:10]}...")
+    logger.info("=" * 50)
 
 async def on_shutdown(dp: Dispatcher):
     logger.info("❌ Бот выключается...")
