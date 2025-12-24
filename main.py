@@ -18,14 +18,10 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 
 # ========== АДМИНЫ ПО УМОЛЧАНИЮ ==========
-# ID или username администраторов
-DEFAULT_ADMINS = {
-    'MaksimXyila': {'id': None, 'username': 'MaksimXyila'},
-    'ar_got': {'id': None, 'username': 'ar_got'}
-}
+DEFAULT_ADMINS = ['MaksimXyila', 'ar_got']  # Без @
 
-# Хранилище администраторов (username -> данные)
-active_admins = {}
+# Динамический список администраторов (добавляются через @)
+active_admins = set(DEFAULT_ADMINS)
 
 if not BOT_TOKEN:
     logger.error("❌ BOT_TOKEN не установлен!")
@@ -48,19 +44,20 @@ class Database:
         self.active_session = False
         
     def add_user(self, user_id, username, full_name, role='user'):
+        username = username or f"user_{user_id}"
+        
         if user_id not in self.users:
             self.users[user_id] = {
                 'id': user_id,
-                'username': username or f"user_{user_id}",
+                'username': username,
                 'full_name': full_name or "Неизвестно",
                 'role': role
             }
             
-            # Если это известный админ по username
-            if username in DEFAULT_ADMINS:
+            # Если username в списке админов
+            if username in active_admins:
                 self.users[user_id]['role'] = 'admin'
-                active_admins[username] = {'id': user_id, 'username': username}
-                logger.info(f"Зарегистрирован админ: {username} (ID: {user_id})")
+                logger.info(f"Зарегистрирован админ: {username}")
             
             if role == 'agent':
                 self.agents[username] = self.users[user_id]
@@ -75,10 +72,8 @@ class Database:
         return None
     
     def set_agent(self, username, full_name=""):
-        # Создаем или обновляем агента
         agent = self.get_user_by_username(username)
         if not agent:
-            # Создаем нового с фиктивным ID
             agent_id = -len(self.agents) - 1
             agent = {
                 'id': agent_id,
@@ -91,6 +86,18 @@ class Database:
         
         agent['role'] = 'agent'
         return agent
+    
+    def add_admin_by_username(self, username):
+        """Добавить администратора по username"""
+        if username not in active_admins:
+            active_admins.add(username)
+            logger.info(f"Добавлен новый админ: {username}")
+        
+        # Обновляем роль существующего пользователя если есть
+        for user in self.users.values():
+            if user['username'] == username:
+                user['role'] = 'admin'
+                break
     
     def get_all_users(self):
         return [user for user in self.users.values() 
@@ -135,14 +142,13 @@ class Database:
         self.transactions.append(transaction)
         self.transaction_counter += 1
         
-        # Обновляем сумму в сессии
         if self.active_session:
             self.current_amount += amount
         
         return transaction
     
     def get_transactions(self):
-        return self.transactions[-10:]  # Последние 10
+        return self.transactions[-10:]
     
     def get_session_stats(self):
         return {
@@ -214,24 +220,30 @@ def get_confirmation_keyboard():
     )
     return keyboard
 
-# ========== ПРОВЕРКА ЯВЛЯЕТСЯ ЛИ АДМИНОМ ==========
+# ========== ПРОВЕРКА АДМИНА ==========
 def is_admin(user):
-    """Проверка, является ли пользователь администратором"""
     if not user:
         return False
     
-    # Проверка по username
     username = user.username or ""
-    if username in DEFAULT_ADMINS:
-        return True
+    return username in active_admins
+
+# ========== ОБРАБОТЧИК ДОБАВЛЕНИЯ АДМИНА ПО @ ==========
+async def handle_admin_addition(message: types.Message, text: str):
+    """Обработка добавления админа в формате: админ @username"""
+    # Ищем паттерн: "админ @username" (регистронезависимо)
+    pattern = r'(?i)админ\s+@(\w+)'
+    match = re.search(pattern, text)
     
-    # Проверка по ID (если админ уже зарегистрирован)
-    user_id = user.id
-    for admin_data in active_admins.values():
-        if admin_data.get('id') == user_id:
-            return True
-    
-    return False
+    if match:
+        # Проверяем что текущий пользователь - админ
+        if not is_admin(message.from_user):
+            await message.answer("⚠️ Только администраторы могут добавлять других админов")
+            return
+        
+        new_admin_username = match.group(1)
+        db.add_admin_by_username(new_admin_username)
+        await message.answer(f"✅ @{new_admin_username} добавлен как администратор")
 
 # ========== КОМАНДЫ ==========
 @dp.message_handler(Command('start'))
@@ -240,7 +252,6 @@ async def start_command(message: types.Message):
     username = message.from_user.username or ""
     full_name = message.from_user.full_name or ""
     
-    # Регистрируем пользователя
     role = 'admin' if is_admin(message.from_user) else 'user'
     db.add_user(user_id, username, full_name, role)
     
@@ -287,56 +298,67 @@ async def stop_command(message: types.Message):
 async def debug_command(message: types.Message):
     """Команда для отладки"""
     user = message.from_user
-    logger.info(f"DEBUG: User: {user.username}, ID: {user.id}, Is admin: {is_admin(user)}")
+    logger.info(f"DEBUG: User: {user.username}, ID: {user.id}")
     
     debug_info = f"""
-👤 **Информация о пользователе:**
-ID: `{user.id}`
+👤 **Информация:**
 Username: @{user.username or 'нет'}
-Имя: {user.full_name}
-Админ: {'✅ Да' if is_admin(user) else '❌ Нет'}
+Админ: {'✅' if is_admin(user) else '❌'}
 
-📊 **Статус сессии:**
-Активна: {'✅ Да' if db.active_session else '❌ Нет'}
+📊 **Сессия:**
+Активна: {'✅' if db.active_session else '❌'}
 Цель: {db.current_target}₽
-Текущая сумма: {db.current_amount}₽
+Текущая: {db.current_amount}₽
 
-💾 **Кэш данных:**
-Админы в кэше: {len(admin_temp_data)}
+👑 **Админы:** {', '.join([f'@{a}' for a in active_admins])}
+
+💾 **Данные в кэше:** {len(admin_temp_data)}
     """
     
     await message.answer(debug_info, parse_mode='Markdown')
 
-# ========== НАЗНАЧЕНИЕ АГЕНТА ==========
+@dp.message_handler(Command('test'))
+async def test_command(message: types.Message):
+    """Тестовая команда"""
+    await message.answer("✅ Бот активен! Проверьте данные:")
+
+# ========== ОБРАБОТКА ВСЕХ СООБЩЕНИЙ ==========
 @dp.message_handler()
-async def handle_messages(message: types.Message):
+async def handle_all_messages(message: types.Message):
     text = message.text or ""
+    user = message.from_user
     
-    # 1. Обработка назначения агента (регистронезависимо)
+    logger.info(f"Сообщение от @{user.username}: {text}")
+    
+    # 1. Проверяем добавление админа
+    if 'админ' in text.lower() and '@' in text:
+        await handle_admin_addition(message, text)
+        return
+    
+    # 2. Проверяем назначение агента
     agent_pattern = r'(?i)агент\s+@(\w+)'
-    match = re.search(agent_pattern, text)
+    agent_match = re.search(agent_pattern, text)
     
-    if match and is_admin(message.from_user):
-        agent_username = match.group(1)
-        agent = db.set_agent(agent_username)
+    if agent_match and is_admin(user):
+        agent_username = agent_match.group(1)
+        db.set_agent(agent_username)
         await message.answer(f"✅ @{agent_username} назначен агентом")
         return
     
-    # 2. Обработка данных админа
-    if is_admin(message.from_user):
+    # 3. Если это админ - обрабатываем данные
+    if is_admin(user):
         await handle_admin_data(message, text)
     else:
-        # Логируем сообщения от не-админов
-        logger.info(f"Сообщение от пользователя @{message.from_user.username}: {text[:50]}")
+        logger.info(f"Игнорируем сообщение от не-админа: @{user.username}")
 
 # ========== ОБРАБОТКА ДАННЫХ АДМИНА ==========
 async def handle_admin_data(message: types.Message, text: str):
     user_id = message.from_user.id
+    username = message.from_user.username or "unknown"
     
-    # Логируем сообщение админа
-    logger.info(f"Сообщение от админа ID {user_id}: {text}")
+    logger.info(f"Обрабатываю данные админа @{username}: {text}")
     
-    # Инициализируем кэш для пользователя
+    # Инициализация кэша
     if user_id not in admin_temp_data:
         admin_temp_data[user_id] = {
             'phone': None,
@@ -349,19 +371,19 @@ async def handle_admin_data(message: types.Message, text: str):
     data = admin_temp_data[user_id]
     data['timestamp'] = asyncio.get_event_loop().time()
     
-    # Ищем телефон (формат: +7XXXXXXXXXX)
+    # Поиск телефона
     phone_match = re.search(r'\+7\d{10}', text)
     if phone_match:
         data['phone'] = phone_match.group()
         logger.info(f"Найден телефон: {data['phone']}")
     
-    # Ищем сумму (форматы: 500! или !500 или просто 500)
+    # Поиск суммы
     amount_match = re.search(r'[!]?(\d+)[!]?', text)
     if amount_match:
         data['amount'] = int(amount_match.group(1))
         logger.info(f"Найдена сумма: {data['amount']}")
     
-    # Ищем банк
+    # Поиск банка
     if '💚Сбер💚' in text:
         data['bank'] = '💚Сбер💚'
         logger.info("Найден банк: Сбер")
@@ -369,35 +391,37 @@ async def handle_admin_data(message: types.Message, text: str):
         data['bank'] = '💛Тбанк💛'
         logger.info("Найден банк: Тбанк")
     
-    # Ищем email (формат: sir+цифры@outluk.ru)
+    # Поиск email - КЛЮЧЕВОЙ МОМЕНТ!
     email_match = re.search(r'sir\+\d+@outluk\.ru', text)
     if email_match:
         data['email'] = email_match.group()
-        logger.info(f"Найден email: {data['email']}")
+        logger.info(f"НАЙДЕН EMAIL: {data['email']}")
         
-        # КОГДА НАШЛИ EMAIL - ОБРАБАТЫВАЕМ ВСЕ ДАННЫЕ
+        # СРАЗУ ЖЕ обрабатываем данные
         await process_admin_data(message, user_id, data)
+        return
     
-    # Очистка старых данных (старше 10 минут)
-    current_time = asyncio.get_event_loop().time()
-    for uid in list(admin_temp_data.keys()):
-        if current_time - admin_temp_data[uid]['timestamp'] > 600:
-            del admin_temp_data[uid]
+    # Если не email, просто логируем
+    logger.info(f"Данные кэшированы для @{username}")
 
 async def process_admin_data(message: types.Message, user_id: int, data: dict):
-    """Обработка полных данных админа после получения email"""
+    """Обработка данных после получения email"""
+    logger.info(f"Начинаю обработку данных для user_id {user_id}")
     
     # Проверяем все ли данные есть
     missing = []
-    if not data.get('phone'): missing.append("номер телефона")
+    if not data.get('phone'): missing.append("телефон")
     if not data.get('amount'): missing.append("сумма")
     if not data.get('bank'): missing.append("банк")
     
     if missing:
-        await message.answer(f"⚠️ Не хватает данных: {', '.join(missing)}")
+        logger.warning(f"Не хватает данных: {missing}")
+        await message.answer(f"⚠️ Не хватает: {', '.join(missing)}")
         return
     
-    # Все данные есть - сохраняем транзакцию
+    logger.info(f"Все данные есть! Телефон: {data['phone']}, Сумма: {data['amount']}, Банк: {data['bank']}, Email: {data['email']}")
+    
+    # Сохраняем транзакцию
     transaction = db.add_transaction(
         data['phone'],
         data['amount'],
@@ -405,31 +429,36 @@ async def process_admin_data(message: types.Message, user_id: int, data: dict):
         data['email']
     )
     
-    # Получаем статистику сессии
+    # Получаем статистику
     stats = db.get_session_stats()
     
-    # Формируем статистику
-    stats_text = f"""📊 **СТАТИСТИКА**
+    # Формируем ответ
+    stats_text = f"""📊 **СТАТИСТИКА ПОСЛЕ ОПЕРАЦИИ**
 
-📞 Номер: `{data['phone']}`
+📞 Телефон: `{data['phone']}`
 💰 Сумма: `{data['amount']}₽`
 🏦 Банк: {data['bank']}
 📧 Email: `{data['email']}`
 
-📈 **СЕССИЯ:**
-Текущий оборот: `{stats['current']}₽`
-Цель на сессию: `{stats['target']}₽`
-Последний перевод: `{data['amount']}₽**"""
+📈 **ТЕКУЩАЯ СЕССИЯ:**
+┣ Текущий оборот: `{stats['current']}₽`
+┣ Цель на сессию: `{stats['target']}₽`
+┗ Прогресс: `{min(100, int(stats['current'] / stats['target'] * 100))}%`"""
 
-    # Добавляем кнопку История
     keyboard = InlineKeyboardMarkup()
     keyboard.add(InlineKeyboardButton("📜 История операций", callback_data="history"))
     
-    await message.answer(stats_text, reply_markup=keyboard, parse_mode='Markdown')
+    try:
+        await message.answer(stats_text, reply_markup=keyboard, parse_mode='Markdown')
+        logger.info("✅ Статистика отправлена успешно!")
+    except Exception as e:
+        logger.error(f"Ошибка отправки статистики: {e}")
+        await message.answer("❌ Ошибка при отправке статистики")
     
-    # Очищаем временные данные
+    # Очищаем кэш
     if user_id in admin_temp_data:
         del admin_temp_data[user_id]
+        logger.info(f"Кэш очищен для user_id {user_id}")
 
 # ========== CALLBACK ОБРАБОТЧИКИ ==========
 @dp.callback_query_handler(lambda c: c.data == 'members')
@@ -483,34 +512,41 @@ async def show_instructions(callback: types.CallbackQuery):
 
 @dp.callback_query_handler(lambda c: c.data in ['subscribe', 'send_receipt'])
 async def send_video(callback: types.CallbackQuery):
-    # Определяем какое видео отправлять
+    # ВИДЕО ПРАВИЛЬНО НАЗНАЧЕНЫ:
+    # "Подключить подписку" -> check.mp4
+    # "Отправка чека" -> instructions.mp4
     if callback.data == 'subscribe':
-        video_filename = 'instructions.mp4'
+        video_filename = 'instructions.mp4'  # ПРАВИЛЬНО!
         caption = "📹 Инструкция по подключению подписки"
-    else:
-        video_filename = 'check.mp4'
+    else:  # send_receipt
+        video_filename = 'check.mp4'  # ПРАВИЛЬНО!
         caption = "📹 Инструкция по отправке чека"
     
     try:
-        # Пытаемся найти и отправить видео
-        # Сначала проверяем локально
-        if os.path.exists(video_filename):
-            video = types.InputFile(video_filename)
-        elif os.path.exists(f"media/{video_filename}"):
-            video = types.InputFile(f"media/{video_filename}")
+        # Пробуем разные пути к файлу
+        video_paths = [
+            video_filename,
+            f"media/{video_filename}",
+            f"/app/{video_filename}",
+            f"/app/media/{video_filename}"
+        ]
+        
+        video_file = None
+        for path in video_paths:
+            if os.path.exists(path):
+                video_file = types.InputFile(path)
+                logger.info(f"Найдено видео: {path}")
+                break
+        
+        if video_file:
+            await bot.send_video(
+                chat_id=callback.message.chat.id,
+                video=video_file,
+                caption=caption
+            )
         else:
-            # Если видео нет - отправляем сообщение
             await callback.message.answer(f"📹 {caption}")
-            await callback.answer()
-            return
-        
-        # Отправляем видео в тот же чат
-        await bot.send_video(
-            chat_id=callback.message.chat.id,
-            video=video,
-            caption=caption
-        )
-        
+            
     except Exception as e:
         logger.error(f"Ошибка отправки видео: {e}")
         await callback.message.answer(f"📹 {caption}")
@@ -561,7 +597,6 @@ async def delete_single_agent(callback: types.CallbackQuery):
     else:
         await callback.answer("❌ Агент не найден")
     
-    # Возвращаемся к списку
     await show_members(callback)
 
 @dp.callback_query_handler(lambda c: c.data == 'confirm_delete_all')
@@ -589,21 +624,21 @@ async def back_to_members(callback: types.CallbackQuery):
 
 # ========== ЗАПУСК ==========
 async def on_startup(dp: Dispatcher):
-    # Устанавливаем команды бота
     commands = [
         types.BotCommand("start", "Запустить бота"),
         types.BotCommand("help", "Помощь и инструкции"),
         types.BotCommand("members", "Список участников"),
         types.BotCommand("rub", "Установить цель на сессию"),
         types.BotCommand("stop", "Остановить сессию"),
-        types.BotCommand("debug", "Отладка (админы)"),
+        types.BotCommand("debug", "Отладка"),
     ]
     await bot.set_my_commands(commands)
     
-    logger.info("=" * 50)
-    logger.info("✅ Бот запущен и готов к работе!")
-    logger.info(f"Токен: {BOT_TOKEN[:10]}...")
-    logger.info("=" * 50)
+    logger.info("=" * 60)
+    logger.info("🤖 Ready!")
+    logger.info(f"Админы по умолчанию: {DEFAULT_ADMINS}")
+    logger.info(f"Токен: {BOT_TOKEN[:15]}...")
+    logger.info("=" * 60)
 
 async def on_shutdown(dp: Dispatcher):
     logger.info("❌ Бот выключается...")
