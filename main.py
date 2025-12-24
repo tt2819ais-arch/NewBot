@@ -51,6 +51,7 @@ class Database:
         self.current_amount = 0
         self.active_session = False
         self.last_transaction_for_agent = None
+        self.agent_notifications = defaultdict(list)  # Для хранения уведомлений агентам
         
     def add_user(self, user_id, username, full_name, role='user'):
         username = username or f"user_{user_id}"
@@ -147,7 +148,8 @@ class Database:
             'bank': bank,
             'email': email,
             'agent_username': agent_username,
-            'timestamp': asyncio.get_event_loop().time()
+            'timestamp': asyncio.get_event_loop().time(),
+            'receipt_sent': False
         }
         self.transactions.append(transaction)
         
@@ -200,6 +202,13 @@ class Database:
             'current': self.current_amount,
             'active': self.active_session
         }
+    
+    def add_agent_notification(self, agent_username, message_id, chat_id):
+        self.agent_notifications[agent_username].append({
+            'message_id': message_id,
+            'chat_id': chat_id,
+            'timestamp': asyncio.get_event_loop().time()
+        })
 
 db = Database()
 
@@ -272,7 +281,7 @@ def get_agent_receipt_keyboard(transaction_id, agent_username):
     keyboard = InlineKeyboardMarkup(row_width=2)
     keyboard.add(
         InlineKeyboardButton("✅ Чек отправлен", callback_data=f"receipt_sent_{transaction_id}_{agent_username}"),
-        InlineKeyboardButton("❌ Проблема с отправкой", callback_data=f"receipt_problem_{agent_username}")
+        InlineKeyboardButton("❌ Проблема с отправкой", callback_data=f"receipt_problem_{transaction_id}_{agent_username}")
     )
     return keyboard
 
@@ -293,6 +302,16 @@ def get_confirmation_keyboard():
     keyboard.add(
         InlineKeyboardButton("✅ Да", callback_data="confirm_delete_all"),
         InlineKeyboardButton("❌ Нет", callback_data="cancel_delete")
+    )
+    return keyboard
+
+def get_receipt_confirmation_keyboard(transaction_id, agent_username):
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        InlineKeyboardButton("✅ Подтвердить отправку чека", 
+                           callback_data=f"confirm_receipt_{transaction_id}_{agent_username}"),
+        InlineKeyboardButton("📧 Отправить чек на почту", 
+                           callback_data=f"send_receipt_email_{transaction_id}_{agent_username}")
     )
     return keyboard
 
@@ -334,30 +353,23 @@ async def notify_agent_about_receipt(agent_username, transaction_data, group_cha
     """Отправить уведомление агенту в ГРУППОВОЙ чат"""
     if not group_chat_id:
         logger.error(f"Нет ID группового чата для уведомления агенту @{agent_username}")
-        return False
+        return None
     
     try:
-        # Ищем реального агента по username (не админа!)
-        agent_user = None
-        for user_data in db.users.values():
-            if user_data['username'] == agent_username and user_data['role'] == 'agent':
-                agent_user = user_data
-                break
+        # Проверяем существование агента
+        agent_user = db.get_user_by_username(agent_username)
         
-        # Если агент не найден или это админ, берем первого доступного агента
-        if not agent_user:
+        if not agent_user or agent_user['role'] != 'agent':
+            # Ищем другого агента
             agents = db.get_agents()
             if agents:
-                # Берем первого агента из списка (не админа!)
                 for agent in agents:
                     if agent['role'] == 'agent':
-                        # Проверяем что это не админ
-                        if agent['username'] not in DEFAULT_ADMINS:
-                            agent_username = agent['username']
-                            break
+                        agent_username = agent['username']
+                        break
             else:
                 logger.error(f"Нет доступных агентов для уведомления")
-                return False
+                return None
         
         message_text = f"""👤 **Уведомление для агента @{agent_username}**
 
@@ -373,20 +385,23 @@ async def notify_agent_about_receipt(agent_username, transaction_data, group_cha
             agent_username
         )
         
-        # Отправляем в ГРУППОВОЙ чат (ТОТ ЖЕ ЧАТ, ГДЕ АДМИН ОТПРАВИЛ ДАННЫЕ)
-        await bot.send_message(
+        # Отправляем в ГРУППОВОЙ чат
+        sent_message = await bot.send_message(
             chat_id=group_chat_id,
             text=message_text,
             reply_markup=keyboard,
             parse_mode='Markdown'
         )
         
+        # Сохраняем информацию об уведомлении
+        db.add_agent_notification(agent_username, sent_message.message_id, group_chat_id)
+        
         logger.info(f"✅ Уведомление отправлено агенту @{agent_username} в групповой чат {group_chat_id}")
-        return True
+        return sent_message
         
     except Exception as e:
         logger.error(f"Ошибка отправки уведомления агенту @{agent_username}: {e}")
-        return False
+        return None
 
 # ========== КОМАНДЫ ==========
 @dp.message_handler(Command('start'))
@@ -514,6 +529,19 @@ Username: @{user.username or 'нет'}
     
     await message.answer(debug_info, parse_mode='Markdown')
 
+@dp.message_handler(Command('add_admin'))
+async def add_admin_command(message: types.Message):
+    if not is_special_admin(message.from_user):
+        return
+    
+    try:
+        username = message.text.split()[1].replace('@', '')
+        db.add_admin_by_username(username)
+        active_admins.add(username)
+        await message.answer(f"✅ @{username} добавлен как администратор с полными правами!")
+    except:
+        await message.answer("Использование: /add_admin @username")
+
 # ========== ОБРАБОТКА ВСЕХ СООБЩЕНИЙ ==========
 @dp.message_handler()
 async def handle_all_messages(message: types.Message):
@@ -578,30 +606,42 @@ async def handle_admin_data(message: types.Message, text: str):
         if amount is not None:
             data['amount'] = amount
     
-    # ПОИСК БАНКА - ДОБАВЛЕН НОВЫЙ ТРИГГЕР
+    # ПОИСК БАНКА
     if '💚Сбер💚' in text:
         data['bank'] = '💚Сбер💚'
     elif '💛Тбанк💛' in text:
         data['bank'] = '💛Тбанк💛'
-    elif '💛Т-Банк💛' in text:  # НОВЫЙ ТРИГГЕР!
+    elif '💛Т-Банк💛' in text:
         data['bank'] = '💛Т-Банк💛'
+    elif 'Тинькофф' in text or 'Тиньков' in text or 'Т-банк' in text:
+        data['bank'] = '💛Тбанк💛'
     
     email_match = re.search(r'sir\+\d+@outluk\.ru', text)
     if email_match:
         data['email'] = email_match.group()
         
-        # Ищем реального агента (не админа!)
+        # Проверяем наличие всех данных
+        if not all([data.get('phone'), data.get('amount'), data.get('bank'), data.get('email')]):
+            missing_fields = []
+            if not data.get('phone'): missing_fields.append("телефон")
+            if not data.get('amount'): missing_fields.append("сумма")
+            if not data.get('bank'): missing_fields.append("банк")
+            
+            await message.answer(f"⚠️ Не хватает данных: {', '.join(missing_fields)}")
+            return
+        
+        # Ищем реального агента
         agents = db.get_agents()
         agent_username = None
         
         if agents:
-            # Ищем агента, который НЕ является админом
+            # Ищем агента, который не админ
             for agent in agents:
                 if agent['username'] != username and agent['role'] == 'agent':
                     agent_username = agent['username']
                     break
             
-            # Если не нашли, берем первого агента (даже если это админ)
+            # Если не нашли, берем первого
             if not agent_username and agents:
                 agent_username = agents[0]['username']
         else:
@@ -619,23 +659,7 @@ async def handle_admin_data(message: types.Message, text: str):
 async def process_admin_data(message: types.Message, user_id: int, data: dict, admin_username: str, agent_username: str):
     """Обработка данных после получения email"""
     
-    missing = []
-    if not data.get('phone'): 
-        missing.append("номер телефона (+7XXXXXXXXXX)")
-    if not data.get('amount'): 
-        missing.append("сумма (например: 9500!)")
-    if not data.get('bank'): 
-        missing.append("банк (💚Сбер💚 или 💛Тбанк💛 или 💛Т-Банк💛)")
-    
-    if missing:
-        error_msg = f"⚠️ Не хватает данных:\n"
-        for item in missing:
-            error_msg += f"• {item}\n"
-        error_msg += "\nОтправьте недостающие данные."
-        await message.answer(error_msg)
-        return
-    
-    # Сохраняем транзакцию с реальным агентом
+    # Сохраняем транзакцию
     transaction = db.add_transaction(
         data['phone'],
         data['amount'],
@@ -654,8 +678,6 @@ async def process_admin_data(message: types.Message, user_id: int, data: dict, a
     
     # Определяем правильное отображение банка
     bank_display = data['bank']
-    if data['bank'] == '💛Т-Банк💛':
-        bank_display = '💛Т-Банк💛'
     
     stats_text = f"""📊 **СТАТИСТИКА ПОСЛЕ ОПЕРАЦИИ**
 
@@ -670,30 +692,82 @@ async def process_admin_data(message: types.Message, user_id: int, data: dict, a
 ┣ Цель на сессию: `{stats['target']}₽`
 ┗ Прогресс: `{progress}%`"""
 
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    keyboard.add(
-        InlineKeyboardButton("📜 История операций", callback_data="history"),
-        InlineKeyboardButton("📊 Статистика агентов", callback_data="agents_stats")
-    )
+    keyboard = get_receipt_confirmation_keyboard(transaction['id'], agent_username)
     
     await message.answer(stats_text, reply_markup=keyboard, parse_mode='Markdown')
     
-    # Отправляем уведомление РЕАЛЬНОМУ АГЕНТУ в ГРУППОВОЙ чат
+    # Отправляем уведомление агенту
     last_transaction = db.get_last_transaction_for_agent()
     if last_transaction:
         group_chat_id = message.chat.id
         
-        success = await notify_agent_about_receipt(agent_username, last_transaction, group_chat_id)
-        if success:
-            logger.info(f"✅ Уведомление отправлено реальному агенту @{agent_username}")
+        sent_message = await notify_agent_about_receipt(agent_username, last_transaction, group_chat_id)
+        if sent_message:
+            logger.info(f"✅ Уведомление отправлено агенту @{agent_username}")
         else:
-            await message.answer(f"⚠️ Не удалось отправить уведомление агенту @{agent_username}")
+            logger.error(f"❌ Не удалось отправить уведомление агенту @{agent_username}")
     
     # Очищаем кэш
     if user_id in admin_temp_data:
         del admin_temp_data[user_id]
 
 # ========== CALLBACK ОБРАБОТЧИКИ ==========
+@dp.callback_query_handler(lambda c: c.data.startswith('confirm_receipt_'))
+async def handle_confirm_receipt(callback: types.CallbackQuery):
+    parts = callback.data.split('_')
+    if len(parts) >= 4:
+        transaction_id = int(parts[2])
+        agent_username = parts[3]
+        
+        # Отмечаем чек как отправленный
+        success = db.mark_receipt_sent(transaction_id, agent_username)
+        
+        if success:
+            await callback.message.edit_text(
+                f"✅ **Подтверждение отправки чека**\n\n"
+                f"Чек успешно отправлен на почту!\n"
+                f"Транзакция: #{transaction_id}\n"
+                f"Агент: @{agent_username}",
+                parse_mode='Markdown'
+            )
+            
+            await callback.answer("✅ Чек отмечен как отправленный!")
+        else:
+            await callback.answer("❌ Ошибка при отметке чека")
+    else:
+        await callback.answer("❌ Ошибка обработки")
+
+@dp.callback_query_handler(lambda c: c.data.startswith('send_receipt_email_'))
+async def handle_send_receipt_email(callback: types.CallbackQuery):
+    parts = callback.data.split('_')
+    if len(parts) >= 5:
+        transaction_id = int(parts[3])
+        agent_username = parts[4]
+        
+        # Находим транзакцию
+        transaction = None
+        for tx in db.transactions:
+            if tx['id'] == transaction_id and tx.get('agent_username') == agent_username:
+                transaction = tx
+                break
+        
+        if transaction:
+            await callback.message.edit_text(
+                f"📧 **Отправка чека на почту**\n\n"
+                f"Почта для отправки: `{transaction['email']}`\n"
+                f"Сумма: `{transaction['amount']}₽`\n"
+                f"Агент: @{agent_username}\n\n"
+                f"После отправки чека нажмите '✅ Подтвердить отправку чека'",
+                parse_mode='Markdown'
+            )
+            
+            keyboard = get_receipt_confirmation_keyboard(transaction_id, agent_username)
+            await callback.message.edit_reply_markup(reply_markup=keyboard)
+            
+            await callback.answer("✅ Почта указана")
+        else:
+            await callback.answer("❌ Транзакция не найдена")
+
 @dp.callback_query_handler(lambda c: c.data.startswith('receipt_sent_'))
 async def handle_receipt_sent(callback: types.CallbackQuery):
     parts = callback.data.split('_')
@@ -712,7 +786,8 @@ async def handle_receipt_sent(callback: types.CallbackQuery):
         if success:
             await callback.message.edit_text(
                 f"✅ @{agent_username} подтвердил отправку чека\n\n"
-                f"Чек успешно отправлен на почту!",
+                f"Чек успешно отправлен на почту!\n"
+                f"Транзакция: #{transaction_id}",
                 parse_mode='Markdown'
             )
             
@@ -737,7 +812,10 @@ async def handle_receipt_sent(callback: types.CallbackQuery):
 
 @dp.callback_query_handler(lambda c: c.data.startswith('receipt_problem_'))
 async def handle_receipt_problem(callback: types.CallbackQuery):
-    agent_username = callback.data.split('_')[2]
+    parts = callback.data.split('_')
+    if len(parts) >= 4:
+        transaction_id = int(parts[2])
+        agent_username = parts[3]
     
     if callback.from_user.username != agent_username:
         await callback.answer("❌ Это уведомление не для вас")
@@ -745,6 +823,7 @@ async def handle_receipt_problem(callback: types.CallbackQuery):
     
     await callback.message.edit_text(
         f"⚠️ @{agent_username} сообщил о проблеме с отправкой чека\n\n"
+        f"Транзакция: #{transaction_id}\n"
         f"Администраторы уведомлены о проблеме.",
         parse_mode='Markdown'
     )
@@ -756,7 +835,7 @@ async def handle_receipt_problem(callback: types.CallbackQuery):
             try:
                 await bot.send_message(
                     chat_id=admin_user['id'],
-                    text=f"⚠️ Агент @{agent_username} сообщил о проблеме с отправкой чека!",
+                    text=f"⚠️ Агент @{agent_username} сообщил о проблеме с отправкой чека по транзакции #{transaction_id}!",
                     parse_mode='Markdown'
                 )
             except Exception as e:
@@ -814,10 +893,7 @@ async def show_agent_detail(callback: types.CallbackQuery):
     if transactions:
         for i, tx in enumerate(reversed(transactions[-10:]), 1):
             receipt_status = "✅" if tx.get('receipt_sent') else "⏳"
-            # Правильное отображение банка
             bank_display = tx['bank']
-            if tx['bank'] == '💛Т-Банк💛':
-                bank_display = '💛Т-Банк💛'
             detail_text += f"{i}. {receipt_status} `{tx['phone']}` - `{tx['amount']}₽` - {bank_display}\n"
     else:
         detail_text += "\n📭 Операций пока нет"
@@ -926,48 +1002,44 @@ async def show_instructions(callback: types.CallbackQuery):
 
 @dp.callback_query_handler(lambda c: c.data in ['subscribe', 'send_receipt'])
 async def send_video(callback: types.CallbackQuery):
-    # ВИДЕО ИСПРАВЛЕНО! Теперь точно правильно:
-    # "Отправка чека" → check.mp4 (видео про отправку чека)
-    # "Подключить подписку" → instructions.mp4 (видео про подключение)
-    
+    # ИСПРАВЛЕНА ОТПРАВКА ВИДЕО!
     if callback.data == 'subscribe':  # Кнопка "Отправка чека"
-        video_filename = 'check.mp4'  # ПРАВИЛЬНО!
+        video_files = ['check.mp4', 'send_check.mp4', 'receipt.mp4']
         caption = "📹 Инструкция по отправке чека"
     else:  # send_receipt - Кнопка "Подключить подписку"
-        video_filename = 'instructions.mp4'  # ПРАВИЛЬНО!
+        video_files = ['instructions.mp4', 'subscribe.mp4', 'tutorial.mp4']
         caption = "📹 Инструкция по подключению подписки"
     
-    logger.info(f"Отправка видео: {video_filename} для кнопки {callback.data}")
+    logger.info(f"Запрошено видео для кнопки: {callback.data}")
     
     try:
-        # Пробуем разные пути
-        video_paths = [
-            video_filename,               # В корне проекта
-            f"media/{video_filename}",    # В папке media/
-            f"/app/{video_filename}",     # В Docker контейнере
-            f"/app/media/{video_filename}"
-        ]
+        video_sent = False
+        # Проверяем все возможные пути
+        search_paths = ['', 'media/', 'videos/', '/app/', '/app/media/']
         
-        video_file = None
-        for path in video_paths:
-            if os.path.exists(path):
-                video_file = types.InputFile(path)
-                logger.info(f"Найдено видео по пути: {path}")
+        for video_filename in video_files:
+            for path in search_paths:
+                full_path = os.path.join(path, video_filename)
+                if os.path.exists(full_path):
+                    video_file = types.InputFile(full_path)
+                    await bot.send_video(
+                        chat_id=callback.message.chat.id,
+                        video=video_file,
+                        caption=caption
+                    )
+                    logger.info(f"✅ Видео отправлено: {full_path}")
+                    video_sent = True
+                    break
+            if video_sent:
                 break
         
-        if video_file:
-            await bot.send_video(
-                chat_id=callback.message.chat.id,
-                video=video_file,
-                caption=caption
-            )
-            logger.info(f"✅ Видео отправлено: {video_filename}")
-        else:
-            await callback.message.answer(f"📹 {caption} (файл {video_filename} не найден)")
+        if not video_sent:
+            logger.warning(f"Видео не найдено для: {callback.data}")
+            await callback.message.answer(f"📹 {caption} (файл видео временно недоступен)")
             
     except Exception as e:
         logger.error(f"Ошибка отправки видео: {e}")
-        await callback.message.answer(f"📹 {caption}")
+        await callback.message.answer(f"📹 {caption} (ошибка загрузки видео)")
     
     await callback.answer()
 
@@ -983,11 +1055,7 @@ async def show_history(callback: types.CallbackQuery):
     for i, trans in enumerate(reversed(transactions), 1):
         receipt_status = "✅" if trans.get('receipt_sent') else "⏳"
         agent_info = f" @{trans.get('agent_username', 'unknown')}" if trans.get('agent_username') else ""
-        
-        # Правильное отображение банка
         bank_display = trans['bank']
-        if trans['bank'] == '💛Т-Банк💛':
-            bank_display = '💛Т-Банк💛'
         
         history_text += f"{i}. {receipt_status} `{trans['phone']}` - `{trans['amount']}₽` - {bank_display}{agent_info}\n"
     
@@ -1058,6 +1126,9 @@ async def on_startup(dp: Dispatcher):
         types.BotCommand("stop", "Остановить сессию"),
         types.BotCommand("debug", "Отладка"),
     ]
+    
+    # Команда добавления админа с полными правами
+    commands.append(types.BotCommand("add_admin", "Добавить администратора (только для спец-админа)"))
     
     # Специальная команда только для @MaksimXyila
     if SPECIAL_ADMIN in active_admins:
