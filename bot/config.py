@@ -1,42 +1,22 @@
-import asyncio
-import logging
-from aiogram import Bot, Dispatcher, executor
-from aiogram.contrib.fsm_storage.memory import MemoryStorage
+import os
+from aiogram import Bot
+from aiogram.types import BotCommand
 
-from .config import config, set_default_commands
-from .handlers import register_handlers
+ADMINS = ['MaksimXyila', 'ar_got']  # Без @
 
-# Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-async def on_startup(dp: Dispatcher):
-    """Действия при запуске бота"""
-    await set_default_commands(dp.bot)
-    logger.info("Бот запущен и готов к работе!")
-
-async def on_shutdown(dp: Dispatcher):
-    """Действия при выключении бота"""
-    logger.info("Бот выключается...")
-
-def main():
-    """Основная функция запуска бота"""
-    bot = Bot(token=config.BOT_TOKEN)
-    dp = Dispatcher(bot, storage=MemoryStorage())
+class Config:
+    BOT_TOKEN = os.getenv('BOT_TOKEN')
+    DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///bot.db')
+    ADMINS = ADMINS
     
-    # Регистрируем обработчики
-    register_handlers(dp)
-    
-    # Запускаем бота
-    executor.start_polling(
-        dp,
-        skip_updates=True,
-        on_startup=on_startup,
-        on_shutdown=on_shutdown
-    )
+config = Config()
 
-if __name__ == '__main__':
-    main()
+async def set_default_commands(bot: Bot):
+    commands = [
+        BotCommand("start", "Запустить бота"),
+        BotCommand("help", "Помощь и инструкции"),
+        BotCommand("members", "Список участников"),
+        BotCommand("rub", "Установить цель на сессию"),
+        BotCommand("stop", "Остановить сессию"),
+    ]
+    await bot.set_my_commands(commands)
