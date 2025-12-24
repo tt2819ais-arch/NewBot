@@ -19,8 +19,6 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 
 # ========== АДМИНЫ ПО УМОЛЧАНИЮ ==========
 DEFAULT_ADMINS = ['MaksimXyila', 'ar_got']  # Без @
-
-# Динамический список администраторов (добавляются через @)
 active_admins = set(DEFAULT_ADMINS)
 
 if not BOT_TOKEN:
@@ -54,7 +52,6 @@ class Database:
                 'role': role
             }
             
-            # Если username в списке админов
             if username in active_admins:
                 self.users[user_id]['role'] = 'admin'
                 logger.info(f"Зарегистрирован админ: {username}")
@@ -88,12 +85,10 @@ class Database:
         return agent
     
     def add_admin_by_username(self, username):
-        """Добавить администратора по username"""
         if username not in active_admins:
             active_admins.add(username)
             logger.info(f"Добавлен новый админ: {username}")
         
-        # Обновляем роль существующего пользователя если есть
         for user in self.users.values():
             if user['username'] == username:
                 user['role'] = 'admin'
@@ -175,8 +170,8 @@ def get_help_menu():
     keyboard = InlineKeyboardMarkup(row_width=1)
     keyboard.add(
         InlineKeyboardButton("Анкета агента", callback_data="agent_form"),
-        InlineKeyboardButton("Подключить подписку", callback_data="subscribe"),
-        InlineKeyboardButton("Отправка чека", callback_data="send_receipt"),
+        InlineKeyboardButton("Отправка чека", callback_data="subscribe"),      # Поменяли название!
+        InlineKeyboardButton("Подключить подписку", callback_data="send_receipt"),  # Поменяли название!
         InlineKeyboardButton("Инструкция агента", callback_data="agent_instructions"),
         InlineKeyboardButton("Назад", callback_data="back_to_main")
     )
@@ -228,22 +223,41 @@ def is_admin(user):
     username = user.username or ""
     return username in active_admins
 
-# ========== ОБРАБОТЧИК ДОБАВЛЕНИЯ АДМИНА ПО @ ==========
+# ========== ОБРАБОТЧИК ДОБАВЛЕНИЯ АДМИНА ==========
 async def handle_admin_addition(message: types.Message, text: str):
-    """Обработка добавления админа в формате: админ @username"""
-    # Ищем паттерн: "админ @username" (регистронезависимо)
     pattern = r'(?i)админ\s+@(\w+)'
     match = re.search(pattern, text)
     
-    if match:
-        # Проверяем что текущий пользователь - админ
-        if not is_admin(message.from_user):
-            await message.answer("⚠️ Только администраторы могут добавлять других админов")
-            return
-        
+    if match and is_admin(message.from_user):
         new_admin_username = match.group(1)
         db.add_admin_by_username(new_admin_username)
         await message.answer(f"✅ @{new_admin_username} добавлен как администратор")
+
+# ========== ИЗВЛЕЧЕНИЕ СУММЫ (ИСПРАВЛЕНО!) ==========
+def extract_amount_from_text(text):
+    """
+    Извлекает сумму ТОЛЬКО из сообщений типа '9500!' или '!9500' или '9500'
+    Игнорирует цифры в email и других местах
+    """
+    # Удаляем все не цифры и восклицательные знаки для проверки
+    clean_text = re.sub(r'[^\d!]', ' ', text)
+    parts = clean_text.split()
+    
+    for part in parts:
+        # Ищем паттерны: 9500! или !9500 или 9500
+        match = re.match(r'^!?(\d+)!?$', part)
+        if match:
+            amount_str = match.group(1)
+            try:
+                amount = int(amount_str)
+                # Проверяем что это не часть email (цифры после sir+)
+                if 'sir+' in text and amount_str in text.split('sir+')[1].split('@')[0]:
+                    continue  # Это цифры из email, пропускаем
+                return amount
+            except ValueError:
+                continue
+    
+    return None
 
 # ========== КОМАНДЫ ==========
 @dp.message_handler(Command('start'))
@@ -296,9 +310,7 @@ async def stop_command(message: types.Message):
 
 @dp.message_handler(Command('debug'))
 async def debug_command(message: types.Message):
-    """Команда для отладки"""
     user = message.from_user
-    logger.info(f"DEBUG: User: {user.username}, ID: {user.id}")
     
     debug_info = f"""
 👤 **Информация:**
@@ -311,24 +323,15 @@ Username: @{user.username or 'нет'}
 Текущая: {db.current_amount}₽
 
 👑 **Админы:** {', '.join([f'@{a}' for a in active_admins])}
-
-💾 **Данные в кэше:** {len(admin_temp_data)}
     """
     
     await message.answer(debug_info, parse_mode='Markdown')
-
-@dp.message_handler(Command('test'))
-async def test_command(message: types.Message):
-    """Тестовая команда"""
-    await message.answer("✅ Бот активен! Проверьте данные:")
 
 # ========== ОБРАБОТКА ВСЕХ СООБЩЕНИЙ ==========
 @dp.message_handler()
 async def handle_all_messages(message: types.Message):
     text = message.text or ""
     user = message.from_user
-    
-    logger.info(f"Сообщение от @{user.username}: {text}")
     
     # 1. Проверяем добавление админа
     if 'админ' in text.lower() and '@' in text:
@@ -348,21 +351,17 @@ async def handle_all_messages(message: types.Message):
     # 3. Если это админ - обрабатываем данные
     if is_admin(user):
         await handle_admin_data(message, text)
-    else:
-        logger.info(f"Игнорируем сообщение от не-админа: @{user.username}")
 
-# ========== ОБРАБОТКА ДАННЫХ АДМИНА ==========
+# ========== ОБРАБОТКА ДАННЫХ АДМИНА (ИСПРАВЛЕНО!) ==========
 async def handle_admin_data(message: types.Message, text: str):
     user_id = message.from_user.id
     username = message.from_user.username or "unknown"
-    
-    logger.info(f"Обрабатываю данные админа @{username}: {text}")
     
     # Инициализация кэша
     if user_id not in admin_temp_data:
         admin_temp_data[user_id] = {
             'phone': None,
-            'amount': None,
+            'amount': None,  # Сумма из сообщения с !
             'bank': None,
             'email': None,
             'timestamp': asyncio.get_event_loop().time()
@@ -371,60 +370,81 @@ async def handle_admin_data(message: types.Message, text: str):
     data = admin_temp_data[user_id]
     data['timestamp'] = asyncio.get_event_loop().time()
     
-    # Поиск телефона
+    logger.info(f"Админ @{username}: '{text}'")
+    
+    # Поиск телефона (+7XXXXXXXXXX)
     phone_match = re.search(r'\+7\d{10}', text)
     if phone_match:
         data['phone'] = phone_match.group()
-        logger.info(f"Найден телефон: {data['phone']}")
+        logger.info(f"  → Телефон: {data['phone']}")
     
-    # Поиск суммы
-    amount_match = re.search(r'[!]?(\d+)[!]?', text)
-    if amount_match:
-        data['amount'] = int(amount_match.group(1))
-        logger.info(f"Найдена сумма: {data['amount']}")
+    # Поиск суммы ТОЛЬКО из сообщений с ! или формата !число
+    amount = extract_amount_from_text(text)
+    if amount is not None:
+        # Дополнительная проверка: если в тексте есть email, убедимся что это не цифры из email
+        if 'sir+' in text:
+            # Извлекаем цифры из email для сравнения
+            email_match = re.search(r'sir\+(\d+)@', text)
+            if email_match:
+                email_digits = email_match.group(1)
+                if str(amount) == email_digits:
+                    logger.info(f"  → Игнорируем сумму {amount} (это цифры из email)")
+                    amount = None  # Не сохраняем, это цифры из email
+        
+        if amount is not None:
+            data['amount'] = amount
+            logger.info(f"  → Сумма: {data['amount']}₽ (из сообщения с !)")
     
     # Поиск банка
     if '💚Сбер💚' in text:
         data['bank'] = '💚Сбер💚'
-        logger.info("Найден банк: Сбер")
+        logger.info("  → Банк: Сбер")
     elif '💛Тбанк💛' in text:
         data['bank'] = '💛Тбанк💛'
-        logger.info("Найден банк: Тбанк")
+        logger.info("  → Банк: Тбанк")
     
-    # Поиск email - КЛЮЧЕВОЙ МОМЕНТ!
+    # Поиск email (sir+цифры@outluk.ru)
     email_match = re.search(r'sir\+\d+@outluk\.ru', text)
     if email_match:
         data['email'] = email_match.group()
-        logger.info(f"НАЙДЕН EMAIL: {data['email']}")
+        logger.info(f"  → Email: {data['email']}")
         
-        # СРАЗУ ЖЕ обрабатываем данные
+        # СРАЗУ обрабатываем данные после получения email
         await process_admin_data(message, user_id, data)
         return
     
-    # Если не email, просто логируем
-    logger.info(f"Данные кэшированы для @{username}")
+    # Очистка старых данных
+    current_time = asyncio.get_event_loop().time()
+    for uid in list(admin_temp_data.keys()):
+        if current_time - admin_temp_data[uid]['timestamp'] > 600:
+            del admin_temp_data[uid]
 
 async def process_admin_data(message: types.Message, user_id: int, data: dict):
     """Обработка данных после получения email"""
-    logger.info(f"Начинаю обработку данных для user_id {user_id}")
     
     # Проверяем все ли данные есть
     missing = []
-    if not data.get('phone'): missing.append("телефон")
-    if not data.get('amount'): missing.append("сумма")
-    if not data.get('bank'): missing.append("банк")
+    if not data.get('phone'): 
+        missing.append("номер телефона (+7XXXXXXXXXX)")
+    if not data.get('amount'): 
+        missing.append("сумма (например: 9500!)")
+    if not data.get('bank'): 
+        missing.append("банк (💚Сбер💚 или 💛Тбанк💛)")
     
     if missing:
-        logger.warning(f"Не хватает данных: {missing}")
-        await message.answer(f"⚠️ Не хватает: {', '.join(missing)}")
+        error_msg = f"⚠️ Не хватает данных:\n"
+        for item in missing:
+            error_msg += f"• {item}\n"
+        error_msg += "\nОтправьте недостающие данные."
+        await message.answer(error_msg)
         return
     
-    logger.info(f"Все данные есть! Телефон: {data['phone']}, Сумма: {data['amount']}, Банк: {data['bank']}, Email: {data['email']}")
+    logger.info(f"✅ Все данные собраны: {data['amount']}₽ от {data['phone']}")
     
-    # Сохраняем транзакцию
+    # Сохраняем транзакцию с ПРАВИЛЬНОЙ суммой
     transaction = db.add_transaction(
         data['phone'],
-        data['amount'],
+        data['amount'],  # Сумма из сообщения с !
         data['bank'],
         data['email']
     )
@@ -433,6 +453,10 @@ async def process_admin_data(message: types.Message, user_id: int, data: dict):
     stats = db.get_session_stats()
     
     # Формируем ответ
+    progress = 0
+    if stats['target'] > 0:
+        progress = min(100, int(stats['current'] / stats['target'] * 100))
+    
     stats_text = f"""📊 **СТАТИСТИКА ПОСЛЕ ОПЕРАЦИИ**
 
 📞 Телефон: `{data['phone']}`
@@ -443,22 +467,16 @@ async def process_admin_data(message: types.Message, user_id: int, data: dict):
 📈 **ТЕКУЩАЯ СЕССИЯ:**
 ┣ Текущий оборот: `{stats['current']}₽`
 ┣ Цель на сессию: `{stats['target']}₽`
-┗ Прогресс: `{min(100, int(stats['current'] / stats['target'] * 100))}%`"""
+┗ Прогресс: `{progress}%`"""
 
     keyboard = InlineKeyboardMarkup()
     keyboard.add(InlineKeyboardButton("📜 История операций", callback_data="history"))
     
-    try:
-        await message.answer(stats_text, reply_markup=keyboard, parse_mode='Markdown')
-        logger.info("✅ Статистика отправлена успешно!")
-    except Exception as e:
-        logger.error(f"Ошибка отправки статистики: {e}")
-        await message.answer("❌ Ошибка при отправке статистики")
+    await message.answer(stats_text, reply_markup=keyboard, parse_mode='Markdown')
     
     # Очищаем кэш
     if user_id in admin_temp_data:
         del admin_temp_data[user_id]
-        logger.info(f"Кэш очищен для user_id {user_id}")
 
 # ========== CALLBACK ОБРАБОТЧИКИ ==========
 @dp.callback_query_handler(lambda c: c.data == 'members')
@@ -512,18 +530,15 @@ async def show_instructions(callback: types.CallbackQuery):
 
 @dp.callback_query_handler(lambda c: c.data in ['subscribe', 'send_receipt'])
 async def send_video(callback: types.CallbackQuery):
-    # ВИДЕО ПРАВИЛЬНО НАЗНАЧЕНЫ:
-    # "Подключить подписку" -> check.mp4
-    # "Отправка чека" -> instructions.mp4
-    if callback.data == 'subscribe':
-        video_filename = 'instructions.mp4'  # ПРАВИЛЬНО!
-        caption = "📹 Инструкция по подключению подписки"
-    else:  # send_receipt
-        video_filename = 'check.mp4'  # ПРАВИЛЬНО!
+    # Видео НЕ меняем местами! Только названия кнопок поменяли
+    if callback.data == 'subscribe':  # Кнопка "Отправка чека"
+        video_filename = 'check.mp4'  # Видео осталось прежним
         caption = "📹 Инструкция по отправке чека"
+    else:  # send_receipt - Кнопка "Подключить подписку"
+        video_filename = 'instructions.mp4'  # Видео осталось прежним
+        caption = "📹 Инструкция по подключению подписки"
     
     try:
-        # Пробуем разные пути к файлу
         video_paths = [
             video_filename,
             f"media/{video_filename}",
@@ -535,7 +550,6 @@ async def send_video(callback: types.CallbackQuery):
         for path in video_paths:
             if os.path.exists(path):
                 video_file = types.InputFile(path)
-                logger.info(f"Найдено видео: {path}")
                 break
         
         if video_file:
@@ -635,9 +649,8 @@ async def on_startup(dp: Dispatcher):
     await bot.set_my_commands(commands)
     
     logger.info("=" * 60)
-    logger.info("🤖 Ready!")
-    logger.info(f"Админы по умолчанию: {DEFAULT_ADMINS}")
-    logger.info(f"Токен: {BOT_TOKEN[:15]}...")
+    logger.info("🤖 БОТ ЗАПУЩЕН И ГОТОВ К РАБОТЕ!")
+    logger.info(f"Админы: {', '.join(active_admins)}")
     logger.info("=" * 60)
 
 async def on_shutdown(dp: Dispatcher):
