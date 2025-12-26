@@ -51,7 +51,6 @@ class Database:
         self.current_amount = 0
         self.active_session = False
         self.last_transaction_for_agent = None
-        self.agent_notifications = defaultdict(list)  # Для хранения уведомлений агентам
         
     def add_user(self, user_id, username, full_name, role='user'):
         username = username or f"user_{user_id}"
@@ -202,18 +201,41 @@ class Database:
             'current': self.current_amount,
             'active': self.active_session
         }
-    
-    def add_agent_notification(self, agent_username, message_id, chat_id):
-        self.agent_notifications[agent_username].append({
-            'message_id': message_id,
-            'chat_id': chat_id,
-            'timestamp': asyncio.get_event_loop().time()
-        })
 
 db = Database()
 
 # ========== ХРАНИЛИЩЕ ДАННЫХ АДМИНА ==========
 admin_temp_data = defaultdict(dict)
+
+# ========== ИСПРАВЛЕННАЯ ФУНКЦИЯ ИЗВЛЕЧЕНИЯ СУММЫ ==========
+def extract_amount_from_text(text):
+    """Извлекает сумму из текста, включая суммы с восклицательными знаками"""
+    # Сначала ищем суммы с восклицательными знаками
+    matches = re.findall(r'(\d{3,})!', text)
+    if matches:
+        try:
+            amount = int(matches[-1])
+            # Проверяем, что это не часть email
+            if f'sir+{amount}@' not in text:
+                return amount
+        except ValueError:
+            pass
+    
+    # Затем ищем суммы без знаков
+    clean_text = re.sub(r'[^\d\s]', ' ', text)
+    parts = clean_text.split()
+    
+    for part in parts:
+        if part.isdigit():
+            try:
+                amount = int(part)
+                # Проверяем, что это не часть email
+                if f'sir+{part}@' not in text:
+                    return amount
+            except ValueError:
+                continue
+    
+    return None
 
 # ========== КЛАВИАТУРЫ ==========
 def get_main_menu():
@@ -330,27 +352,9 @@ def is_special_admin(user):
     username = user.username or ""
     return username == SPECIAL_ADMIN
 
-# ========== ИЗВЛЕЧЕНИЕ СУММЫ ==========
-def extract_amount_from_text(text):
-    clean_text = re.sub(r'[^\d!]', ' ', text)
-    parts = clean_text.split()
-    
-    for part in parts:
-        match = re.match(r'^!?(\d+)!?$', part)
-        if match:
-            amount_str = match.group(1)
-            if 'sir+' in text and amount_str in text.split('sir+')[1].split('@')[0]:
-                continue
-            try:
-                return int(amount_str)
-            except ValueError:
-                continue
-    
-    return None
-
-# ========== ОТПРАВКА УВЕДОМЛЕНИЯ АГЕНТУ ==========
+# ========== ОТПРАВКА УВЕДОМЛЕНИЯ АГЕНТУ С ПРЕМИУМ ЭМОДЗИ ==========
 async def notify_agent_about_receipt(agent_username, transaction_data, group_chat_id):
-    """Отправить уведомление агенту в ГРУППОВОЙ чат"""
+    """Отправить уведомление агенту в ГРУППОВОЙ чат с премиум эмодзи"""
     if not group_chat_id:
         logger.error(f"Нет ID группового чата для уведомления агенту @{agent_username}")
         return None
@@ -371,9 +375,13 @@ async def notify_agent_about_receipt(agent_username, transaction_data, group_cha
                 logger.error(f"Нет доступных агентов для уведомления")
                 return None
         
-        message_text = f"""👤 **Уведомление для агента @{agent_username}**
+        # Добавляем премиум эмодзи из Telegram Premium
+        # 💫 с document_id=5872974298146149488
+        premium_emoji = "💫"
+        
+        message_text = f"""{premium_emoji} **Уведомление для агента @{agent_username}** {premium_emoji}
 
-📧 Получены реквизиты для отправки чека:
+📧 **Получены реквизиты для отправки чека:**
 • Email: `{transaction_data['email']}`
 • Сумма: `{transaction_data['amount']}₽`
 • Банк: {transaction_data['bank']}
@@ -392,9 +400,6 @@ async def notify_agent_about_receipt(agent_username, transaction_data, group_cha
             reply_markup=keyboard,
             parse_mode='Markdown'
         )
-        
-        # Сохраняем информацию об уведомлении
-        db.add_agent_notification(agent_username, sent_message.message_id, group_chat_id)
         
         logger.info(f"✅ Уведомление отправлено агенту @{agent_username} в групповой чат {group_chat_id}")
         return sent_message
@@ -542,7 +547,7 @@ async def add_admin_command(message: types.Message):
     except:
         await message.answer("Использование: /add_admin @username")
 
-# ========== ОБРАБОТКА ВСЕХ СООБЩЕНИЙ ==========
+# ========== ИСПРАВЛЕННАЯ ОБРАБОТКА ВСЕХ СООБЩЕНИЙ ==========
 @dp.message_handler()
 async def handle_all_messages(message: types.Message):
     text = message.text or ""
@@ -573,61 +578,57 @@ async def handle_admin_addition(message: types.Message, text: str):
         db.add_admin_by_username(new_admin_username)
         await message.answer(f"✅ @{new_admin_username} добавлен как администратор")
 
-# ========== ОБРАБОТКА ДАННЫХ АДМИНА ==========
+# ========== ИСПРАВЛЕННАЯ ОБРАБОТКА ДАННЫХ АДМИНА ==========
 async def handle_admin_data(message: types.Message, text: str):
-    user_id = message.from_user.id
-    username = message.from_user.username or "unknown"
+    """Новая логика: обрабатываем ВСЕ данные из одного сообщения"""
     
-    if user_id not in admin_temp_data:
-        admin_temp_data[user_id] = {
-            'phone': None,
-            'amount': None,
-            'bank': None,
-            'email': None,
-            'timestamp': asyncio.get_event_loop().time()
-        }
+    # Извлекаем все данные из текста
+    extracted_data = {
+        'phone': None,
+        'amount': None,
+        'bank': None,
+        'email': None
+    }
     
-    data = admin_temp_data[user_id]
-    data['timestamp'] = asyncio.get_event_loop().time()
-    
+    # 1. Поиск телефона
     phone_match = re.search(r'\+7\d{10}', text)
     if phone_match:
-        data['phone'] = phone_match.group()
+        extracted_data['phone'] = phone_match.group()
     
-    amount = extract_amount_from_text(text)
-    if amount is not None:
-        if 'sir+' in text:
-            email_match = re.search(r'sir\+(\d+)@', text)
-            if email_match:
-                email_digits = email_match.group(1)
-                if str(amount) == email_digits:
-                    amount = None
-        
-        if amount is not None:
-            data['amount'] = amount
+    # 2. Поиск суммы с исправленной логикой
+    extracted_data['amount'] = extract_amount_from_text(text)
     
-    # ПОИСК БАНКА
+    # 3. Поиск банка
     if '💚Сбер💚' in text:
-        data['bank'] = '💚Сбер💚'
+        extracted_data['bank'] = '💚Сбер💚'
     elif '💛Тбанк💛' in text:
-        data['bank'] = '💛Тбанк💛'
+        extracted_data['bank'] = '💛Тбанк💛'
     elif '💛Т-Банк💛' in text:
-        data['bank'] = '💛Т-Банк💛'
+        extracted_data['bank'] = '💛Т-Банк💛'
     elif 'Тинькофф' in text or 'Тиньков' in text or 'Т-банк' in text:
-        data['bank'] = '💛Тбанк💛'
+        extracted_data['bank'] = '💛Тбанк💛'
     
+    # 4. Поиск почты
     email_match = re.search(r'sir\+\d+@outluk\.ru', text)
     if email_match:
-        data['email'] = email_match.group()
+        extracted_data['email'] = email_match.group()
+    
+    # Проверяем, есть ли все необходимые данные
+    if extracted_data['email']:
+        # Проверяем наличие всех обязательных полей
+        missing_fields = []
+        if not extracted_data.get('phone'): 
+            missing_fields.append("телефон (+7XXXXXXXXXX)")
+        if not extracted_data.get('amount'): 
+            missing_fields.append("сумма (например: 500!)")
+        if not extracted_data.get('bank'): 
+            missing_fields.append("банк (💚Сбер💚 или 💛Тбанк💛)")
         
-        # Проверяем наличие всех данных
-        if not all([data.get('phone'), data.get('amount'), data.get('bank'), data.get('email')]):
-            missing_fields = []
-            if not data.get('phone'): missing_fields.append("телефон")
-            if not data.get('amount'): missing_fields.append("сумма")
-            if not data.get('bank'): missing_fields.append("банк")
-            
-            await message.answer(f"⚠️ Не хватает данных: {', '.join(missing_fields)}")
+        if missing_fields:
+            error_msg = f"⚠️ Не хватает данных:\n"
+            for item in missing_fields:
+                error_msg += f"• {item}\n"
+            await message.answer(error_msg)
             return
         
         # Ищем реального агента
@@ -637,7 +638,7 @@ async def handle_admin_data(message: types.Message, text: str):
         if agents:
             # Ищем агента, который не админ
             for agent in agents:
-                if agent['username'] != username and agent['role'] == 'agent':
+                if agent['role'] == 'agent':
                     agent_username = agent['username']
                     break
             
@@ -648,16 +649,10 @@ async def handle_admin_data(message: types.Message, text: str):
             # Если нет агентов, используем запасное имя
             agent_username = "agent"
         
-        await process_admin_data(message, user_id, data, username, agent_username)
-        return
-    
-    current_time = asyncio.get_event_loop().time()
-    for uid in list(admin_temp_data.keys()):
-        if current_time - admin_temp_data[uid]['timestamp'] > 600:
-            del admin_temp_data[uid]
+        await process_admin_data(message, extracted_data, agent_username)
 
-async def process_admin_data(message: types.Message, user_id: int, data: dict, admin_username: str, agent_username: str):
-    """Обработка данных после получения email"""
+async def process_admin_data(message: types.Message, data: dict, agent_username: str):
+    """Обработка данных после получения всех реквизитов"""
     
     # Сохраняем транзакцию
     transaction = db.add_transaction(
@@ -676,7 +671,6 @@ async def process_admin_data(message: types.Message, user_id: int, data: dict, a
     if stats['target'] > 0:
         progress = min(100, int(stats['current'] / stats['target'] * 100))
     
-    # Определяем правильное отображение банка
     bank_display = data['bank']
     
     stats_text = f"""📊 **СТАТИСТИКА ПОСЛЕ ОПЕРАЦИИ**
@@ -696,7 +690,7 @@ async def process_admin_data(message: types.Message, user_id: int, data: dict, a
     
     await message.answer(stats_text, reply_markup=keyboard, parse_mode='Markdown')
     
-    # Отправляем уведомление агенту
+    # Отправляем уведомление агенту с премиум эмодзи
     last_transaction = db.get_last_transaction_for_agent()
     if last_transaction:
         group_chat_id = message.chat.id
@@ -706,10 +700,6 @@ async def process_admin_data(message: types.Message, user_id: int, data: dict, a
             logger.info(f"✅ Уведомление отправлено агенту @{agent_username}")
         else:
             logger.error(f"❌ Не удалось отправить уведомление агенту @{agent_username}")
-    
-    # Очищаем кэш
-    if user_id in admin_temp_data:
-        del admin_temp_data[user_id]
 
 # ========== CALLBACK ОБРАБОТЧИКИ ==========
 @dp.callback_query_handler(lambda c: c.data.startswith('confirm_receipt_'))
@@ -1002,7 +992,6 @@ async def show_instructions(callback: types.CallbackQuery):
 
 @dp.callback_query_handler(lambda c: c.data in ['subscribe', 'send_receipt'])
 async def send_video(callback: types.CallbackQuery):
-    # ИСПРАВЛЕНА ОТПРАВКА ВИДЕО!
     if callback.data == 'subscribe':  # Кнопка "Отправка чека"
         video_files = ['check.mp4', 'send_check.mp4', 'receipt.mp4']
         caption = "📹 Инструкция по отправке чека"
@@ -1014,7 +1003,6 @@ async def send_video(callback: types.CallbackQuery):
     
     try:
         video_sent = False
-        # Проверяем все возможные пути
         search_paths = ['', 'media/', 'videos/', '/app/', '/app/media/']
         
         for video_filename in video_files:
